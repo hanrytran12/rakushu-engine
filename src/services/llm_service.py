@@ -25,6 +25,7 @@ class LlmEnrichmentService:
         prompt: str,
         system_prompt: Optional[str] = None,
         max_attempts: Optional[int] = None,
+        request_purpose: str = "generic",
     ) -> Optional[Dict[str, Any]]:
         """Invokes local LLM with bounded retries and returns parsed JSON or None."""
         base = self.local_llm_url.rstrip("/")
@@ -73,9 +74,9 @@ class LlmEnrichmentService:
                 last_status = res.status_code
                 if diagnostics_enabled and res.status_code != 200:
                     logger.info(
-                        "[LLM DIAGNOSTIC %s] model=%s attempt=%s status=%s "
+                        "[LLM DIAGNOSTIC %s] purpose=%s model=%s attempt=%s status=%s "
                         "outcome=http_error request_ms=%.2f response_chars=%s",
-                        request_tag, self.local_llm_model, attempt, res.status_code,
+                        request_tag, request_purpose, self.local_llm_model, attempt, res.status_code,
                         request_elapsed_ms, len(str(getattr(res, "text", "") or "")),
                     )
                 if res.status_code == 200:
@@ -107,12 +108,12 @@ class LlmEnrichmentService:
                             return round(count * 1_000_000_000 / duration_ns, 2)
 
                         logger.info(
-                            "[LLM DIAGNOSTIC %s] model=%s attempt=%s status=%s "
+                            "[LLM DIAGNOSTIC %s] purpose=%s model=%s attempt=%s status=%s "
                             "prompt_chars=%s response_chars=%s num_ctx=%s http_elapsed_ms=%.2f "
                             "ollama_total_ms=%s model_load_ms=%s prompt_eval_count=%s "
                             "prompt_eval_ms=%s prompt_eval_tokens_per_sec=%s eval_count=%s "
                             "eval_ms=%s generation_tokens_per_sec=%s",
-                            request_tag, self.local_llm_model, attempt, res.status_code,
+                            request_tag, request_purpose, self.local_llm_model, attempt, res.status_code,
                             len(prompt), len(raw_content), num_ctx, request_elapsed_ms,
                             metric_ms("total_duration"), metric_ms("load_duration"),
                             metric_display("prompt_eval_count"), metric_ms("prompt_eval_duration"),
@@ -125,8 +126,8 @@ class LlmEnrichmentService:
                     except Exception as parse_exc:
                         if diagnostics_enabled:
                             logger.warning(
-                                "[LLM DIAGNOSTIC %s] JSON parse failed: %s: %s",
-                                request_tag, type(parse_exc).__name__, parse_exc,
+                                "[LLM DIAGNOSTIC %s] purpose=%s JSON parse failed: %s: %s",
+                                request_tag, request_purpose, type(parse_exc).__name__, parse_exc,
                             )
                         raise
                     if diagnostics_enabled:
@@ -137,8 +138,8 @@ class LlmEnrichmentService:
                             if isinstance(item, dict)
                         ] if isinstance(returned_sentences, list) else []
                         logger.info(
-                            "[LLM DIAGNOSTIC %s] parsed_type=%s keys=%s sentence_ids=%s",
-                            request_tag, type(data).__name__,
+                            "[LLM DIAGNOSTIC %s] purpose=%s parsed_type=%s keys=%s sentence_ids=%s",
+                            request_tag, request_purpose, type(data).__name__,
                             list(data.keys()) if isinstance(data, dict) else [],
                             returned_ids,
                         )
@@ -146,25 +147,25 @@ class LlmEnrichmentService:
                         return data
                 response_chars = len(str(getattr(res, "text", "") or ""))
                 logger.warning(
-                    "[LLM Retry %s/%s] Status %s (response_chars=%s)",
-                    attempt, attempts, res.status_code, response_chars,
+                    "[LLM Retry %s/%s] purpose=%s Status %s (response_chars=%s)",
+                    attempt, attempts, request_purpose, res.status_code, response_chars,
                 )
             except Exception as exc:
                 request_elapsed_ms = (time.perf_counter() - request_started) * 1000
                 if diagnostics_enabled:
                     logger.info(
-                        "[LLM DIAGNOSTIC %s] model=%s attempt=%s outcome=exception "
+                        "[LLM DIAGNOSTIC %s] purpose=%s model=%s attempt=%s outcome=exception "
                         "request_ms=%.2f error_type=%s",
-                        request_tag, self.local_llm_model, attempt, request_elapsed_ms,
+                        request_tag, request_purpose, self.local_llm_model, attempt, request_elapsed_ms,
                         type(exc).__name__,
                     )
-                logger.warning(f"[LLM Retry {attempt}/{attempts}] Call failed: {exc}")
+                logger.warning(f"[LLM Retry {attempt}/{attempts}] purpose={request_purpose} Call failed: {exc}")
 
             if attempt < attempts:
                 time.sleep(1.0)
 
         logger.error(
-            f"[LLM FAILED] Failed all {attempts} attempts "
+            f"[LLM FAILED] purpose={request_purpose} Failed all {attempts} attempts "
             f"(last_status={last_status})."
         )
         return None
@@ -209,7 +210,7 @@ class LlmEnrichmentService:
     def _compact_chunk_prompt_items(
         items: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        """Compacts occurrence candidates, showing each dictionary gloss only once per entry."""
+        """Compacts token candidates using only pre-existing Vietnamese dictionary meanings."""
         compact_items: List[Dict[str, Any]] = []
         for item in items:
             compact_candidates: Dict[str, Dict[str, Any]] = {}
@@ -219,9 +220,7 @@ class LlmEnrichmentService:
                     if not isinstance(candidates, list):
                         continue
 
-                    valid_candidates = []
-                    entry_refs: Dict[Tuple[str, str, str, str], str] = {}
-                    gloss_emitted = set()
+                    entries_by_identity: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
                     for candidate in candidates:
                         if not isinstance(candidate, dict):
                             continue
@@ -233,26 +232,22 @@ class LlmEnrichmentService:
                         term = str(candidate.get("term", "")).strip()
                         reading = str(candidate.get("reading", "")).strip()
                         dictionary_pos = str(candidate.get("pos", "")).strip()
-                        gloss_en = str(candidate.get("gloss_en", "")).strip()[:240]
-                        entry_identity = (term, reading, dictionary_pos, gloss_en)
-                        entry_ref = entry_refs.get(entry_identity)
-                        if entry_ref is None:
-                            entry_ref = f"{token_key}-e{len(entry_refs) + 1}"
-                            entry_refs[entry_identity] = entry_ref
-
-                        include_gloss = entry_identity not in gloss_emitted
-                        gloss_emitted.add(entry_identity)
-                        valid_candidates.append({
+                        entry_identity = (term, reading, dictionary_pos)
+                        entry = entries_by_identity.get(entry_identity)
+                        if entry is None:
+                            entry = {
+                                "term": term,
+                                "reading": reading,
+                                "pos": dictionary_pos,
+                                "candidates": [],
+                            }
+                            entries_by_identity[entry_identity] = entry
+                        entry["candidates"].append({
                             "candidate_id": candidate_id,
-                            "entry_ref": entry_ref,
-                            "term": term,
-                            "reading": reading,
-                            "pos": dictionary_pos,
-                            "meaning": meaning,
-                            "gloss_en": gloss_en if include_gloss else "",
+                            "meaning_vi": meaning,
                         })
 
-                    if valid_candidates:
+                    if entries_by_identity:
                         first_candidate = next(
                             (
                                 candidate for candidate in candidates
@@ -266,8 +261,9 @@ class LlmEnrichmentService:
                             "token": str(first_candidate.get("token", "")).strip(),
                             "lemma": str(first_candidate.get("lemma", "")).strip(),
                             "token_pos": str(first_candidate.get("token_pos", "")).strip(),
-                            "candidates": valid_candidates,
+                            "entries": list(entries_by_identity.values()),
                         }
+
             compact_items.append({
                 "sentence_number": int(item["sentence_number"]),
                 "text": str(item.get("text", "")),
@@ -286,9 +282,10 @@ class LlmEnrichmentService:
 
         prompt_items = self._compact_chunk_prompt_items(items)
         prompt = f"""Bạn là engine dịch Nhật-Việt cho Rakushu.
-Dịch và làm giàu TẤT CẢ các câu dưới đây trong một lần gọi.
-Giữ nguyên số câu và tuyệt đối không gộp, bỏ hoặc đổi số câu.
-Ngữ cảnh trong cùng chunk được dùng để hiểu đại từ, chủ thể và liên kết diễn ngôn. Candidate payload được nhóm theo token_key; mỗi nhóm có token, lemma, token_pos và candidates gồm candidate_id, entry_ref, term, reading, POS, meaning_vi, gloss_en. Nhiều candidate_id có thể cùng entry_ref nhưng mang meaning_vi khác nhau. gloss_en chỉ được ghi ở candidate đầu tiên của một entry để tránh lặp payload; nó mô tả entry và có thể chứa nhiều nghĩa, không phải bản dịch 1:1 của từng meaning_vi. Dùng gloss_en của candidate đầu tiên cùng entry_ref làm bằng chứng từ vựng chính; meaning_vi là tham khảo/fallback, không bắt buộc là cách diễn đạt tiếng Việt tốt nhất trong câu. Với MỖI token_key có candidates, phải trả về đúng một token_selection; không được bỏ sót chỉ vì bản dịch câu đã hoàn tất. Chỉ chọn candidate_id có sẵn trong đúng token_key, ưu tiên entry_ref/term/reading/POS phù hợp. Đối chiếu gloss_en với ngữ cảnh để xác định sense tiếng Anh phù hợp, sau đó điền selected_sense_en bằng cụm nghĩa ngắn có căn cứ trong gloss_en và contextual_meaning_vi bằng nghĩa tiếng Việt ngắn gọn, đúng ngữ cảnh. contextual_meaning_vi được phép khác meaning_vi có sẵn nếu gloss_en và câu nguồn hỗ trợ cách hiểu đó; không dịch tất cả sense trong gloss_en cùng lúc. Không chọn nghĩa chỉ vì mặt chữ giống nhau nếu POS/reading không phù hợp. Không tự sinh candidate_id hoặc gán candidate từ token_key khác. Nếu gloss_en trống hoặc không đủ thông tin, dùng meaning_vi làm fallback và không đoán một nghĩa mới.
+Dịch tất cả các câu dưới đây sang tiếng Việt, giữ nguyên số câu và không gộp, bỏ hoặc đổi số câu.
+Candidate payload được nhóm theo token_key. Mỗi token có thể có nhiều entries; mỗi entry có term, reading, POS và candidates chứa candidate_id cùng meaning_vi. meaning_vi là nghĩa tiếng Việt có sẵn trong dictionary và là nguồn duy nhất để chọn nghĩa cho token đã biết; hãy giữ nguyên nghĩa đã chọn.
+Với MỖI token_key có candidates, trả về đúng một token_selection chỉ gồm token_key và candidate_id. Chọn candidate dựa trên nghĩa tiếng Việt có sẵn, câu nguồn tiếng Nhật, lemma/reading/POS và ngữ cảnh. Chỉ chọn candidate_id có trong đúng token_key; tuyệt đối không tạo ID mới hoặc lấy candidate từ token khác. Nếu các nghĩa trong dictionary đều không phù hợp, vẫn chọn candidate phù hợp nhất trong các lựa chọn hiện có thay vì tự bịa nghĩa.
+Phần dịch phải giữ đủ tất cả mệnh đề, phủ định, nguyên nhân-kết quả, thời gian và đối tượng trong câu nguồn; tự rà soát theo từng mệnh đề trước khi trả lời. Nếu câu dịch còn thiếu ý, không được đánh dấu complete=true. oov_learning chỉ dùng cho từ thực sự chưa có candidate phù hợp trong dictionary.
 
 INPUT:
 {json.dumps(prompt_items, ensure_ascii=False)}
@@ -299,18 +296,20 @@ Trả về JSON đúng cấu trúc:
     {{
       "sentence_number": 1,
       "translation_vi": "...",
-      "token_selections": [{{"token_key": "t1", "candidate_id": "t1-c1", "selected_sense_en": "sense grounded in gloss_en", "contextual_meaning_vi": "nghĩa tiếng Việt theo ngữ cảnh"}}],
+      "translation_review": {{"complete": true, "missing_content": []}},
+      "token_selections": [{{"token_key": "t1", "candidate_id": "t1-c1"}}],
       "oov_learning": [{{"term": "...", "pos": "NOUN", "suggested_meaning": "...", "confidence_score": 0.95}}]
     }}
   ]
 }}
 Chỉ trả JSON. Không thêm markdown hay giải thích.
 """
-        res = self._call_llm(prompt, max_attempts=max_attempts)
+        res = self._call_llm(prompt, max_attempts=max_attempts, request_purpose="chunk_translation")
         if not res or not isinstance(res.get("sentences"), list):
             return {}
 
         expected = {int(item["sentence_number"]) for item in items}
+        input_by_number = {int(item["sentence_number"]): item for item in items}
         parsed: Dict[int, Dict[str, Any]] = {}
         for item in res["sentences"]:
             if not isinstance(item, dict):
@@ -320,15 +319,54 @@ Chỉ trả JSON. Không thêm markdown hay giải thích.
             except (TypeError, ValueError):
                 continue
             translation = str(item.get("translation_vi", "")).strip()
-            if number in expected and number not in parsed and translation:
-                normalized_selections = []
-                for selection in item.get("token_selections", []) or []:
-                    if isinstance(selection, dict):
-                        normalized = dict(selection)
-                        normalized["sentence_number"] = number
-                        normalized_selections.append(normalized)
-                item["token_selections"] = normalized_selections
-                parsed[number] = item
+            if number not in expected or number in parsed or not translation:
+                continue
+
+            if self._has_explicit_translation_gap(item):
+                review = item.get("translation_review", {})
+                missing = review.get("missing_content", []) if isinstance(review, dict) else []
+                missing_count = len(missing) if isinstance(missing, (list, tuple, str)) else int(bool(missing))
+                logger.warning(
+                    "[Translation Completeness Reject] purpose=chunk_translation sentence=%s "
+                    "reason=explicitly_incomplete missing_content_count=%s",
+                    number, missing_count,
+                )
+                continue
+
+            normalized_selections = []
+            for selection in item.get("token_selections", []) or []:
+                if isinstance(selection, dict):
+                    normalized = dict(selection)
+                    normalized["sentence_number"] = number
+                    normalized_selections.append(normalized)
+            item["token_selections"] = normalized_selections
+            candidate_groups = input_by_number.get(number, {}).get("token_candidates", {})
+            multi_candidate_keys = {}
+            if isinstance(candidate_groups, dict):
+                for key, values in candidate_groups.items():
+                    valid_ids = {
+                        str(candidate.get("candidate_id", "")).strip()
+                        for candidate in values
+                        if isinstance(candidate, dict) and str(candidate.get("candidate_id", "")).strip()
+                    } if isinstance(values, list) else set()
+                    if len(valid_ids) > 1:
+                        multi_candidate_keys[str(key)] = valid_ids
+            selected_by_key = {
+                str(selection.get("token_key", "")).strip(): str(selection.get("candidate_id", "")).strip()
+                for selection in normalized_selections
+                if isinstance(selection, dict)
+            }
+            missing_keys = sorted(
+                key for key, candidate_ids in multi_candidate_keys.items()
+                if selected_by_key.get(key) not in candidate_ids
+            )
+            if missing_keys:
+                logger.warning(
+                    "[Token Selection Coverage] sentence=%s multi_candidate_groups=%s "
+                    "missing_token_keys=%s",
+                    number, len(multi_candidate_keys), missing_keys,
+                )
+            parsed[number] = item
         return parsed
 
     @staticmethod
@@ -366,6 +404,16 @@ Chỉ trả JSON. Không thêm markdown hay giải thích.
     def _normalize_translation(text: str) -> str:
         """Normalizes whitespace and case for repeat-detection comparisons."""
         return re.sub(r"\s+", " ", str(text or "").strip()).casefold()
+
+    @staticmethod
+    def _has_explicit_translation_gap(result: Dict[str, Any]) -> bool:
+        """Returns true only when the model explicitly reports omitted content."""
+        review = result.get("translation_review") if isinstance(result, dict) else None
+        if not isinstance(review, dict):
+            return False
+        missing = review.get("missing_content")
+        has_missing_content = bool(missing.strip()) if isinstance(missing, str) else bool(missing)
+        return review.get("complete") is False or has_missing_content
 
     def _translate_chunk_adaptive(
         self,
@@ -568,36 +616,43 @@ Chỉ trả JSON. Không thêm markdown hay giải thích.
         known_summary = [f"- {k.term} ({k.reading}): {k.meaning}" for k in matched_knowledge]
         content_tokens = [t.surface for t in tokens if t.pos not in ("PUNCTUATION", "PARTICLE", "AUX_VERB")]
         oov_terms_list = list({tok.surface: tok for tok in oov_tokens}.values())
+        compact_token_candidates = self._compact_chunk_prompt_items([{
+            "sentence_number": 1,
+            "text": sentence_text,
+            "token_candidates": token_candidates,
+        }])[0]["token_candidates"]
 
         prompt = f"""Ngữ cảnh tham khảo (không cần dịch lại):
 {context_text or "[Không có ngữ cảnh bổ sung]"}
 
- Câu cần dịch: "{sentence_text}"
- Từ điển: {known_summary}
- Từ chính: {content_tokens}
- Từ OOV: {[t.surface for t in oov_terms_list]}
- Dictionary token candidates: {json.dumps(token_candidates, ensure_ascii=False)}
+Câu cần dịch: "{sentence_text}"
+Từ điển: {known_summary}
+Từ chính: {content_tokens}
+Từ OOV: {[t.surface for t in oov_terms_list]}
+Dictionary token candidates (chỉ chứa nghĩa tiếng Việt đã có trong dictionary): {json.dumps(compact_token_candidates, ensure_ascii=False)}
 
 Yêu cầu dịch CHỈ câu cần dịch sang tiếng Việt và trả về JSON:
-- "translation_vi": bản dịch tiếng Việt của câu
-- "token_selections": [{{"token_key": "t1", "candidate_id": "t1-c1", "selected_sense_en": "sense trong gloss_en", "contextual_meaning_vi": "nghĩa tiếng Việt theo ngữ cảnh"}}]; token_key PHẢI là key có trong Dictionary token candidates của câu hiện tại và candidate_id PHẢI thuộc đúng token_key. Dựa vào gloss_en để xác định sense, rồi tự diễn đạt contextual_meaning_vi ngắn gọn bằng tiếng Việt theo câu nguồn; meaning_vi chỉ là tham khảo/fallback. Chỉ tạo contextual_meaning_vi khi candidate có gloss_en phù hợp; nếu không, dùng meaning_vi làm fallback. KHÔNG tự điền token/surface/phrase trong selection.
-- "oov_learning": [{{"term": "từ OOV", "pos": "NOUN", "suggested_meaning": "định nghĩa", "confidence_score": 0.95}}]
-- "context_sufficient": true nếu ngữ cảnh hiện tại đủ để xác định các đại từ/tham chiếu; false nếu cần thêm ngữ cảnh
-- "context_issue": mô tả ngắn điều còn thiếu, nếu có
+- "translation_vi": bản dịch tiếng Việt đầy đủ và tự nhiên của câu, giữ đủ từng mệnh đề và phủ định từ câu nguồn.
+- "translation_review": {{"complete": true, "missing_content": []}}; tự đối chiếu từng mệnh đề nguồn. Nếu còn bỏ sót nội dung, đặt complete=false và liệt kê ngắn các loại nội dung bị thiếu.
+- "token_selections": [{{"token_key": "t1", "candidate_id": "t1-c1"}}]; với mỗi token_key có candidates, chọn đúng một candidate_id tồn tại dưới đúng token_key dựa trên meaning_vi có sẵn và ngữ cảnh. Không tạo nghĩa mới cho token đã có trong dictionary.
+- "oov_learning": [{{"term": "từ OOV", "pos": "NOUN", "suggested_meaning": "định nghĩa", "confidence_score": 0.95}}]; chỉ đề xuất cho từ thật sự chưa có candidate phù hợp.
+- "context_sufficient": true nếu ngữ cảnh hiện tại đủ để xác định các đại từ/tham chiếu; false nếu cần thêm ngữ cảnh.
+- "context_issue": mô tả ngắn điều còn thiếu, nếu có.
 """
 
         logger.info(f"[Sentence Fallback] Target: {sentence_text}")
         logger.info(f"[Sentence Fallback] Initial context: 3 before + target + 2 after")
         logger.info(f"[Sentence Fallback] Initial context text:\n{context_text or '[NO CONTEXT]'}")
-        res = self._call_llm(prompt)
-        if res and res.get("context_sufficient") is False and expanded_context_text:
-            logger.info(f"[Sentence Fallback] Context insufficient for target: {sentence_text}")
+        res = self._call_llm(prompt, request_purpose="sentence_fallback")
+        if res and (res.get("context_sufficient") is False or self._has_explicit_translation_gap(res)) and expanded_context_text:
+            reason = "translation_incomplete" if self._has_explicit_translation_gap(res) else "context_insufficient"
+            logger.info(f"[Sentence Fallback] Retrying with expanded context; reason={reason}")
             logger.info(f"[Sentence Fallback] Expanding context: 10 before + target + 3 after")
             logger.info(f"[Sentence Fallback] Expanded context text:\n{expanded_context_text}")
             prompt = prompt.replace(context_text or "[Không có ngữ cảnh bổ sung]", expanded_context_text)
             prompt = prompt.replace("Ngữ cảnh hiện tại chưa đủ.", "Đây là lần thử mở rộng ngữ cảnh; ưu tiên ngữ cảnh gần target.")
-            res = self._call_llm(prompt)
-        if res and "translation_vi" in res:
+            res = self._call_llm(prompt, request_purpose="sentence_fallback_expanded")
+        if res and "translation_vi" in res and not self._has_explicit_translation_gap(res):
             vi_trans = str(res.get("translation_vi", "")).strip()
             if vi_trans and vi_trans.lower() not in ("bản dịch tiếng việt tự nhiên", "bản dịch tiếng việt"):
                 raw_selections = res.get("token_selections", [])
@@ -606,6 +661,15 @@ Yêu cầu dịch CHỈ câu cần dịch sang tiếng Việt và trả về JSO
                 logger.info(f"[Sentence Fallback] SUCCESS target='{sentence_text}' | translation='{vi_trans}'")
                 return vi_trans, t_meanings, cands
 
+        if res and self._has_explicit_translation_gap(res):
+            review = res.get("translation_review", {})
+            missing = review.get("missing_content", []) if isinstance(review, dict) else []
+            missing_count = len(missing) if isinstance(missing, (list, tuple, str)) else int(bool(missing))
+            logger.warning(
+                "[Translation Completeness Reject] purpose=sentence_fallback "
+                "reason=explicitly_incomplete missing_content_count=%s",
+                missing_count,
+            )
         self.last_sentence_translation_failed = True
         logger.warning(f"[Sentence Fallback] FINAL FAILURE target='{sentence_text}' | returning empty translation")
         km = {d.term: d.meaning.split("(")[0].strip() for d in matched_knowledge}
@@ -717,33 +781,6 @@ Yêu cầu dịch CHỈ câu cần dịch sang tiếng Việt và trả về JSO
                 )
                 continue
 
-            selected_candidate = next(
-                (
-                    candidate for candidate in token_candidates.get(token_key, [])
-                    if str(candidate.get("candidate_id", "")).strip() == candidate_id
-                ),
-                None,
-            )
-            contextual_meaning = str(selection.get("contextual_meaning_vi", "")).strip()
-            selected_sense_en = str(selection.get("selected_sense_en", "")).strip()
-            candidate_gloss = str(selected_candidate.get("gloss_en", "")).strip() if selected_candidate else ""
-
-            # Only use generated meanings after validating the exact candidate and token occurrence.
-            # Keep the dictionary value as fallback when the chosen entry has no English gloss.
-            if contextual_meaning and candidate_gloss:
-                if len(contextual_meaning) <= 120 and "\n" not in contextual_meaning:
-                    meaning = contextual_meaning
-                    logger.debug(
-                        "[Token Contextual Meaning] token_key=%s candidate_id=%s "
-                        "selected_sense_en=%r contextual_meaning_vi=%r",
-                        token_key, candidate_id, selected_sense_en, contextual_meaning,
-                    )
-                else:
-                    logger.warning(
-                        "[Token Contextual Meaning Reject] invalid contextual meaning "
-                        "for token_key=%s candidate_id=%s; using dictionary fallback.",
-                        token_key, candidate_id,
-                    )
 
             resolved[token.token_id] = meaning
             resolved[token.surface] = meaning

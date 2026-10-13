@@ -165,6 +165,27 @@ class TestRakushuPipeline(unittest.TestCase):
         self.assertEqual(first.context_meaning, "nghĩ lần một")
         self.assertEqual(second.context_meaning, "nghĩ lần hai")
 
+    def test_03f_iru_lemma_excludes_same_reading_lexical_homographs(self):
+        """The lemma いる resolves to 居る rather than 入る/射る/要る/炒る."""
+        from unittest.mock import patch
+
+        knowledge = KnowledgeService()
+        previous = TokenModel(surface="に", lemma="に", reading="ニ", pos="PARTICLE")
+        token = TokenModel(surface="い", lemma="いる", reading="イル", pos="VERB")
+        entries = [
+            DictionaryEntry(term="射る", reading="いる", pos="Ichidan verb, transitive verb", meaning="bắn bằng cung"),
+            DictionaryEntry(term="炒る", reading="いる", pos="Godan verb, transitive verb", meaning="rang"),
+            DictionaryEntry(term="入る", reading="いる", pos="Godan verb, intransitive verb", meaning="vào"),
+            DictionaryEntry(term="要る", reading="いる", pos="Godan verb, intransitive verb", meaning="cần thiết"),
+            DictionaryEntry(term="居る", reading="いる", pos="Ichidan verb, intransitive verb, auxiliary verb", meaning="tồn tại"),
+        ]
+        with patch.object(knowledge, "lookup_candidates", return_value=entries) as lookup:
+            candidates = knowledge.build_token_candidates([previous, token])
+
+        self.assertEqual([candidate["term"] for candidate in candidates["t2"]], ["居る"])
+        self.assertEqual(candidates["t2"][0]["meaning"], "tồn tại")
+        self.assertEqual(lookup.call_args_list[0].args[0], "いる")
+
     def test_03e_candidate_builder_uses_local_context_for_kana_homographs(self):
         """Numeric つ is a counter and こと after いう is the abstract 事 sense."""
         from unittest.mock import patch
@@ -280,7 +301,7 @@ class TestRakushuPipeline(unittest.TestCase):
         }
         prompts = []
 
-        def fake_call_llm(prompt, system_prompt=None, max_attempts=None):
+        def fake_call_llm(prompt, system_prompt=None, max_attempts=None, request_purpose=None):
             prompts.append(prompt)
             return {
                 "sentences": [
@@ -309,11 +330,59 @@ class TestRakushuPipeline(unittest.TestCase):
         self.assertEqual(len(prompts), 1)
         self.assertIn('"token_candidates"', prompts[0])
         self.assertIn('"candidate_id": "t1-c1"', prompts[0])
-        self.assertIn('"meaning": "cảm lạnh"', prompts[0])
-        self.assertIn("phải trả về đúng một token_selection", prompts[0])
-        self.assertIn("Dùng gloss_en", prompts[0])
-        self.assertIn("contextual_meaning_vi", prompts[0])
-        self.assertIn("meaning_vi là tham khảo/fallback", prompts[0])
+        self.assertIn('"meaning_vi": "cảm lạnh"', prompts[0])
+        self.assertIn("trả về đúng một token_selection chỉ gồm token_key và candidate_id", prompts[0])
+        self.assertIn("là nguồn duy nhất để chọn nghĩa cho token đã biết", prompts[0])
+        self.assertNotIn("gloss_en", prompts[0])
+        self.assertNotIn("contextual_meaning_vi", prompts[0])
+        self.assertNotIn("selected_sense_en", prompts[0])
+
+    def test_06ca_sentence_fallback_uses_vietnamese_candidates_without_gloss(self):
+        """The sentence fallback sends Vietnamese-only choices and resolves the dictionary value."""
+        from unittest.mock import patch
+
+        llm_svc = LlmEnrichmentService()
+        token = TokenModel(surface="思う", lemma="思う", reading="おもう", pos="VERB")
+        prompts = []
+        candidate = {
+            "candidate_id": "t1-c1",
+            "token_id": token.token_id,
+            "token": "思う",
+            "lemma": "思う",
+            "term": "思う",
+            "reading": "おもう",
+            "pos": "VERB",
+            "meaning": "tưởng tượng",
+            "gloss_en": "SECRET_ENGLISH_GLOSS_MUST_NOT_BE_SENT",
+        }
+
+        def fake_call_llm(prompt, system_prompt=None, max_attempts=None, request_purpose=None):
+            prompts.append(prompt)
+            return {
+                "translation_vi": "Tôi nghĩ vậy.",
+                "token_selections": [{
+                    "token_key": "t1",
+                    "candidate_id": "t1-c1",
+                    "selected_sense_en": "to think",
+                    "contextual_meaning_vi": "nghĩ",
+                }],
+                "oov_learning": [],
+            }
+
+        with patch.object(llm_svc, "_call_llm", side_effect=fake_call_llm):
+            translation, meanings, _ = llm_svc.translate_sentence_with_context(
+                sentence_text="そう思う。",
+                tokens=[token],
+                token_candidates={"t1": [candidate]},
+            )
+
+        self.assertEqual(translation, "Tôi nghĩ vậy.")
+        self.assertEqual(meanings[token.token_id], "tưởng tượng")
+        self.assertEqual(len(prompts), 1)
+        self.assertNotIn("SECRET_ENGLISH_GLOSS_MUST_NOT_BE_SENT", prompts[0])
+        self.assertNotIn("gloss_en", prompts[0])
+        self.assertNotIn("selected_sense_en", prompts[0])
+        self.assertNotIn("contextual_meaning_vi", prompts[0])
 
     def test_06d_chunk_translation_retries_repeated_translation_collapse(self):
         """Repeated output for distinct source sentences is retried individually."""
@@ -322,7 +391,7 @@ class TestRakushuPipeline(unittest.TestCase):
         llm_svc = LlmEnrichmentService()
         calls = []
 
-        def fake_call(prompt, system_prompt=None, max_attempts=None):
+        def fake_call(prompt, system_prompt=None, max_attempts=None, request_purpose=None):
             payload = json.loads(
                 prompt.split("INPUT:\n", 1)[1].split("\n\nTrả về JSON", 1)[0]
             )
@@ -367,7 +436,7 @@ class TestRakushuPipeline(unittest.TestCase):
         llm_svc = LlmEnrichmentService()
         calls = []
 
-        def fake_call(prompt, system_prompt=None, max_attempts=None):
+        def fake_call(prompt, system_prompt=None, max_attempts=None, request_purpose=None):
             payload = json.loads(
                 prompt.split("INPUT:\n", 1)[1].split("\n\nTrả về JSON", 1)[0]
             )
@@ -438,18 +507,20 @@ class TestRakushuPipeline(unittest.TestCase):
         self.assertEqual(compact[0]["token_candidates"]["t1"]["token_pos"], "NOUN")
         self.assertEqual(compact[0]["token_candidates"]["t1"]["lemma"], "風邪")
         group = compact[0]["token_candidates"]["t1"]
-        candidates = group["candidates"]
+        self.assertEqual(len(group["entries"]), 1)
+        entry = group["entries"][0]
+        candidates = entry["candidates"]
         self.assertEqual([c["candidate_id"] for c in candidates], ["t1-c1", "t1-c2"])
-        self.assertEqual([c["meaning"] for c in candidates], ["cảm lạnh", "lạnh, gió lạnh"])
-        self.assertEqual([c["entry_ref"] for c in candidates], ["t1-e1", "t1-e1"])
-        self.assertTrue(all(c["term"] == "風邪" for c in candidates))
-        self.assertTrue(all(c["reading"] == "かぜ" for c in candidates))
-        self.assertTrue(all(c["pos"] == "NOUN" for c in candidates))
-        self.assertEqual(candidates[0]["gloss_en"], "common cold; influenza; flu")
-        self.assertEqual(candidates[1]["gloss_en"], "", "Shared entry gloss must not be duplicated.")
-        self.assertNotIn("token_id", json.dumps(compact, ensure_ascii=False))
+        self.assertEqual([c["meaning_vi"] for c in candidates], ["cảm lạnh", "lạnh, gió lạnh"])
+        self.assertEqual(entry["term"], "風邪")
+        self.assertEqual(entry["reading"], "かぜ")
+        self.assertEqual(entry["pos"], "NOUN")
+        compact_json = json.dumps(compact, ensure_ascii=False)
+        self.assertNotIn("gloss_en", compact_json)
+        self.assertNotIn("common cold", compact_json)
+        self.assertNotIn("token_id", compact_json)
         self.assertLess(
-            len(json.dumps(compact, ensure_ascii=False)),
+            len(compact_json),
             len(json.dumps(items, ensure_ascii=False)),
         )
 
@@ -511,10 +582,11 @@ class TestRakushuPipeline(unittest.TestCase):
             patch("requests.post", return_value=FakeResponse()),
             self.assertLogs("RakushuPipeline", level="INFO") as captured,
         ):
-            result = service._call_llm("PRIVATE_SOURCE_SENTENCE", max_attempts=1)
+            result = service._call_llm("PRIVATE_SOURCE_SENTENCE", max_attempts=1, request_purpose="unit_test")
 
         self.assertTrue(result["ok"])
         logs = "\\n".join(captured.output)
+        self.assertIn("purpose=unit_test", logs)
         self.assertIn("http_elapsed_ms=", logs)
         self.assertIn("ollama_total_ms=1500.0", logs)
         self.assertIn("model_load_ms=200.0", logs)
@@ -707,7 +779,7 @@ class TestRakushuPipeline(unittest.TestCase):
     def test_08_chunk_translation_validates_sentence_numbers(self):
         """Chunk translation returns valid items and leaves missing sentences for fallback."""
         llm_svc = LlmEnrichmentService()
-        llm_svc._call_llm = lambda prompt, system_prompt=None, max_attempts=None: {
+        llm_svc._call_llm = lambda prompt, system_prompt=None, max_attempts=None, request_purpose=None: {
             "sentences": [
                 {"sentence_number": 1, "translation_vi": "dịch 1", "token_meanings": {}, "oov_learning": []},
                 {"sentence_number": 3, "translation_vi": "dịch 3", "token_meanings": {}, "oov_learning": []},
@@ -726,7 +798,7 @@ class TestRakushuPipeline(unittest.TestCase):
         llm_svc = LlmEnrichmentService()
         calls = []
 
-        def fake_call(prompt, system_prompt=None, max_attempts=None):
+        def fake_call(prompt, system_prompt=None, max_attempts=None, request_purpose=None):
             import json
             calls.append((prompt, max_attempts))
             payload = json.loads(prompt.split("INPUT:\n", 1)[1].split("\n\nTrả về JSON", 1)[0])
@@ -764,7 +836,7 @@ class TestRakushuPipeline(unittest.TestCase):
             {"context_sufficient": False, "context_issue": "referent unclear"},
             {"translation_vi": "dịch", "token_meanings": {}, "oov_learning": [], "context_sufficient": True},
         ])
-        def fake_call(prompt, system_prompt=None, max_attempts=None):
+        def fake_call(prompt, system_prompt=None, max_attempts=None, request_purpose=None):
             prompts.append(prompt)
             return next(responses)
         llm_svc._call_llm = fake_call
@@ -801,7 +873,7 @@ class TestRakushuPipeline(unittest.TestCase):
         """Ensures Stage 2 receives nearby context instead of the transcript prefix."""
         llm_svc = LlmEnrichmentService()
         captured = {}
-        llm_svc._call_llm = lambda prompt, system_prompt=None: (captured.update(prompt=prompt) or {
+        llm_svc._call_llm = lambda prompt, system_prompt=None, request_purpose=None: (captured.update(prompt=prompt) or {
             "translation_vi": "dịch",
             "token_meanings": {},
             "oov_learning": [],
@@ -911,8 +983,8 @@ class TestRakushuPipeline(unittest.TestCase):
         )
         self.assertEqual(phrase, {})
 
-    def test_14a_gloss_based_contextual_meaning_overrides_static_vietnamese(self):
-        """A validated candidate can yield a contextual Vietnamese sense based on its gloss."""
+    def test_14a_dictionary_meaning_is_authoritative_even_with_legacy_llm_context_fields(self):
+        """Legacy generated fields cannot override the selected Vietnamese dictionary meaning."""
         llm_svc = LlmEnrichmentService()
         token = NlpService().tokenize(SubtitleSegment(text="思う"))[0]
         candidates = {
@@ -941,11 +1013,11 @@ class TestRakushuPipeline(unittest.TestCase):
             [token],
         )
 
-        self.assertEqual(resolved[token.token_id], "nghĩ")
-        self.assertEqual(resolved[token.surface], "nghĩ")
+        self.assertEqual(resolved[token.token_id], "tưởng tượng")
+        self.assertEqual(resolved[token.surface], "tưởng tượng")
 
-    def test_14aa_contextual_meaning_falls_back_without_gloss(self):
-        """LLM cannot replace the dictionary meaning when there is no English gloss evidence."""
+    def test_14aa_dictionary_meaning_is_authoritative_without_any_english_gloss(self):
+        """Candidate resolution has no dependency on English gloss availability."""
         llm_svc = LlmEnrichmentService()
         token = NlpService().tokenize(SubtitleSegment(text="思う"))[0]
         candidates = {
@@ -1225,6 +1297,114 @@ class TestRakushuPipeline(unittest.TestCase):
 
         self.assertTrue(any("rẻ, giá thấp" in phrase.translation for phrase in phrases))
         self.assertFalse(any("安い" == phrase.translation for phrase in phrases))
+
+
+    def test_19_explicitly_incomplete_chunk_translation_is_retried(self):
+        """A model-reported clause omission is rejected, then recovered for that sentence."""
+        import json
+
+        service = LlmEnrichmentService()
+        calls = []
+
+        def fake_call(prompt, system_prompt=None, max_attempts=None, request_purpose=None):
+            payload = json.loads(
+                prompt.split("INPUT:\n", 1)[1].split("\n\nTrả về JSON", 1)[0]
+            )
+            numbers = [item["sentence_number"] for item in payload]
+            calls.append(numbers)
+            if len(payload) > 1:
+                return {"sentences": [
+                    {
+                        "sentence_number": 1,
+                        "translation_vi": "Bản dịch thiếu một mệnh đề.",
+                        "translation_review": {"complete": False, "missing_content": ["mệnh đề cuối"]},
+                    },
+                    {
+                        "sentence_number": 2,
+                        "translation_vi": "Bản dịch đầy đủ hai.",
+                        "translation_review": {"complete": True, "missing_content": []},
+                    },
+                ]}
+            number = payload[0]["sentence_number"]
+            return {"sentences": [{
+                "sentence_number": number,
+                "translation_vi": f"Bản dịch đầy đủ {number}.",
+                "translation_review": {"complete": True, "missing_content": []},
+            }]}
+
+        service._call_llm = fake_call
+        with self.assertLogs("RakushuPipeline", level="WARNING") as captured:
+            result = service.translate_chunk([
+                {"sentence_number": 1, "text": "一方で、別の事実も起きた。"},
+                {"sentence_number": 2, "text": "現場の人は全員避難した。"},
+            ])
+        self.assertEqual(sorted(result), [1, 2])
+        self.assertEqual(result[1]["translation_vi"], "Bản dịch đầy đủ 1.")
+        self.assertEqual(calls, [[1, 2], [1]])
+        self.assertIn("Translation Completeness Reject", "\\n".join(captured.output))
+
+    def test_20_missing_multi_candidate_selections_are_audited(self):
+        """Missing sense choices are visible in logs without discarding a good sentence translation."""
+        service = LlmEnrichmentService()
+        item = {
+            "sentence_number": 4,
+            "text": "今日はポイントを説明します。",
+            "token_candidates": {
+                "t1": [
+                    {"candidate_id": "t1-c1", "meaning": "hôm nay"},
+                    {"candidate_id": "t1-c2", "meaning": "ngày nay"},
+                ],
+            },
+        }
+        service._call_llm = lambda prompt, system_prompt=None, max_attempts=None, request_purpose=None: {
+            "sentences": [{"sentence_number": 4, "translation_vi": "Hôm nay tôi sẽ giải thích các điểm chính."}]
+        }
+        with self.assertLogs("RakushuPipeline", level="WARNING") as captured:
+            result = service._translate_chunk_batch([item])
+        self.assertIn(4, result)
+        self.assertIn("missing_token_keys=['t1']", "\\n".join(captured.output))
+
+    def test_21_sentence_fallback_rejects_explicitly_incomplete_translation(self):
+        """Sentence fallback does not publish a translation whose self-review says it is incomplete."""
+        service = LlmEnrichmentService()
+        service._call_llm = lambda prompt, system_prompt=None, max_attempts=None, request_purpose=None: {
+            "translation_vi": "Bản dịch bỏ sót một phần.",
+            "translation_review": {"complete": False, "missing_content": ["mệnh đề cuối"]},
+            "context_sufficient": True,
+        }
+        with self.assertLogs("RakushuPipeline", level="WARNING") as captured:
+            translated, meanings, oov = service.translate_sentence_with_context(
+                sentence_text="しかし、工場は稼働を続け、住民は避難した。",
+            )
+        self.assertEqual(translated, "")
+        self.assertTrue(service.last_sentence_translation_failed)
+        self.assertIn("Translation Completeness Reject", "\\n".join(captured.output))
+
+
+    def test_22_oov_validation_request_is_purpose_labeled(self):
+        """OOV validation inference is distinguishable from translation requests."""
+        from src.services import LlmOovValidator
+
+        llm_service = LlmEnrichmentService()
+        captured = {}
+
+        def fake_call(prompt, system_prompt=None, max_attempts=None, request_purpose=None):
+            captured["purpose"] = request_purpose
+            return {
+                "is_valid": True,
+                "confidence_score": 0.9,
+                "tentative_reading": "おし",
+                "tentative_pos": "NOUN",
+                "suggested_meaning": "người được hâm mộ",
+            }
+
+        llm_service._call_llm = fake_call
+        validator = LlmOovValidator(llm_service)
+        token = TokenModel(surface="推し", lemma="推し", pos="NOUN", reading="おし")
+        valid, candidate = validator.validate_and_enhance(token, "私の推しは彼です。")
+        self.assertTrue(valid)
+        self.assertIsNotNone(candidate)
+        self.assertEqual(captured["purpose"], "oov_validation")
 
 if __name__ == "__main__":
     unittest.main()

@@ -85,7 +85,7 @@ Trả về đúng định dạng JSON:
   "nuance": "sắc thái sử dụng hoặc nguồn gốc tiếng lóng"
 }}"""
         try:
-            return self.llm_service._call_llm(prompt)
+            return self.llm_service._call_llm(prompt, request_purpose="oov_validation")
         except Exception as exc:
             logger.warning(f"LLM validation query failed for '{term}': {exc}")
             return None

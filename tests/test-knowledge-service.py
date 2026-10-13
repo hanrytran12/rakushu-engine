@@ -221,5 +221,117 @@ class TestKnowledgeService(unittest.TestCase):
             if os.path.exists(tmp_db):
                 os.remove(tmp_db)
 
+
+    def test_07_candidate_builder_never_uses_english_gloss_as_meaning(self):
+        """A blank Vietnamese field stays unavailable instead of becoming an English candidate."""
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            tmp_db = f.name
+        try:
+            conn = sqlite3.connect(tmp_db)
+            conn.execute(
+                "CREATE TABLE staging_entries "
+                "(term TEXT, reading TEXT, pos TEXT, meaning_vi TEXT, gloss_en TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO staging_entries VALUES (?, ?, ?, ?, ?)",
+                ("テスト語", "てすとご", "noun", "", "an English-only test gloss"),
+            )
+            conn.commit()
+            conn.close()
+
+            service = KnowledgeService(db_path=tmp_db, exclude_terms=set())
+            self.assertEqual(service.lookup_candidates("テスト語"), [])
+            self.assertIsNone(service.lookup("テスト語"))
+        finally:
+            if os.path.exists(tmp_db):
+                os.remove(tmp_db)
+
+    def test_08_exact_term_candidates_take_priority_over_reading_homographs(self):
+        """An exact lexical term excludes unrelated entries that merely share its reading."""
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            tmp_db = f.name
+        try:
+            conn = sqlite3.connect(tmp_db)
+            conn.execute(
+                "CREATE TABLE staging_entries "
+                "(term TEXT, reading TEXT, pos TEXT, meaning_vi TEXT, gloss_en TEXT)"
+            )
+            conn.executemany(
+                "INSERT INTO staging_entries VALUES (?, ?, ?, ?, ?)",
+                [
+                    ("いる", "いる", "Ichidan verb", "ở, tồn tại", "to exist"),
+                    ("射る", "いる", "Ichidan verb", "bắn bằng cung", "to shoot"),
+                    ("炒る", "いる", "Godan verb", "rang, sao", "to roast"),
+                    ("入る", "いる", "Godan verb", "đi vào", "to enter"),
+                ],
+            )
+            conn.commit()
+            conn.close()
+
+            service = KnowledgeService(db_path=tmp_db, exclude_terms=set())
+            candidates = service.lookup_candidates("いる", limit=5)
+            self.assertEqual([entry.term for entry in candidates], ["いる"])
+            self.assertEqual(candidates[0].meaning, "ở, tồn tại")
+            lookup = service.lookup("いる")
+            self.assertIsNotNone(lookup)
+            self.assertEqual(lookup.term, "いる")
+        finally:
+            if os.path.exists(tmp_db):
+                os.remove(tmp_db)
+
+    def test_09_auxiliary_iru_after_te_does_not_receive_lexical_candidates(self):
+        """The auxiliary iru in a te-iru construction is handled grammatically, not lexically."""
+        from unittest.mock import patch
+
+        service = KnowledgeService(exclude_terms=set())
+        tokens = [
+            TokenModel(surface="食べ", lemma="食べる", reading="タベ", pos="VERB"),
+            TokenModel(surface="て", lemma="て", reading="テ", pos="PARTICLE"),
+            TokenModel(surface="い", lemma="いる", reading="イル", pos="VERB"),
+            TokenModel(surface="ます", lemma="ます", reading="マス", pos="AUX_VERB"),
+        ]
+        with patch.object(
+            service,
+            "lookup_candidates",
+            return_value=[DictionaryEntry(
+                term="いる", reading="いる", pos="Ichidan verb", meaning="ở"
+            )],
+        ):
+            candidates = service.build_token_candidates(tokens)
+        self.assertNotIn("t3", candidates)
+
+
+    def test_10_lookup_skips_empty_vi_rows_before_valid_exact_term_row(self):
+        """A blank first row does not hide a Vietnamese entry for the same exact term."""
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            tmp_db = f.name
+        try:
+            conn = sqlite3.connect(tmp_db)
+            conn.execute(
+                "CREATE TABLE staging_entries "
+                "(term TEXT, reading TEXT, pos TEXT, meaning_vi TEXT, gloss_en TEXT)"
+            )
+            conn.executemany(
+                "INSERT INTO staging_entries VALUES (?, ?, ?, ?, ?)",
+                [
+                    ("後続語", "こうぞくご", "noun", "", "English-only first row"),
+                    ("後続語", "こうぞくご", "noun", "nghĩa tiếng Việt", "English metadata"),
+                    ("同音語", "こうぞくご", "noun", "nghĩa homograph", "homograph gloss"),
+                ],
+            )
+            conn.commit()
+            conn.close()
+
+            service = KnowledgeService(db_path=tmp_db, exclude_terms=set())
+            entry = service.lookup("後続語")
+            candidates = service.lookup_candidates("後続語")
+            self.assertIsNotNone(entry)
+            self.assertEqual(entry.meaning, "nghĩa tiếng Việt")
+            self.assertEqual([candidate.meaning for candidate in candidates], ["nghĩa tiếng Việt"])
+            self.assertEqual([candidate.term for candidate in candidates], ["後続語"])
+        finally:
+            if os.path.exists(tmp_db):
+                os.remove(tmp_db)
+
 if __name__ == "__main__":
     unittest.main()
