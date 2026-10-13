@@ -72,6 +72,7 @@ class DictionaryEntry:
     meaning: str = ""
     sequence: int = 0
     term_tags: str = ""
+    gloss_en: str = ""
 
     def to_dict(self):
         return asdict(self)

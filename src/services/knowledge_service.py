@@ -65,7 +65,7 @@ class KnowledgeService:
                     )
                     r = cur.fetchone()
                     if r:
-                        entry = DictionaryEntry(term=r[0], reading=r[1], pos=r[2], meaning=r[3] or r[4] or "")
+                        entry = DictionaryEntry(term=r[0], reading=r[1], pos=r[2], meaning=r[3] or r[4] or "", gloss_en=r[4] or "")
                         self.in_memory_cache[word] = entry
                         return entry
                 else:
@@ -136,13 +136,25 @@ class KnowledgeService:
                         (word, word, limit * 3),
                     )
                     for term, reading, pos, meaning_vi, gloss_en in cur.fetchall():
-                        for sense in self._expand_meanings((meaning_vi or gloss_en or "").strip()):
+                        # Preserve Vietnamese senses when available. English glosses are
+                        # attached as row-level context below; imported sense ordering/count
+                        # is not guaranteed to align across languages.
+                        if meaning_vi and meaning_vi.strip():
+                            senses = self._expand_meanings(meaning_vi.strip())
+                        else:
+                            senses = self._expand_meanings((gloss_en or "").strip())
+
+                        for sense_index, sense in enumerate(senses):
                             key = (term, reading, pos, sense)
                             if sense and key not in seen:
                                 seen.add(key)
+                                # Imported Vietnamese/English gloss lists do not always
+                                # have the same sense count/order. Keep the complete entry
+                                # gloss as context instead of falsely pairing senses by index.
                                 candidates.append(
                                     DictionaryEntry(
-                                        term=term, reading=reading, pos=pos, meaning=sense
+                                        term=term, reading=reading, pos=pos, meaning=sense,
+                                        gloss_en=(gloss_en or "")[:240],
                                     )
                                 )
                             if len(candidates) >= limit:
@@ -183,19 +195,151 @@ class KnowledgeService:
                 candidates.append(fallback)
         return candidates
 
+    GRAMMATICAL_ONLY_SURFACES = {
+        "な", "か", "よ", "ね", "の", "で", "に", "は", "が", "を", "も",
+        "と", "て", "へ", "や", "さ", "ぞ", "たり", "けど", "けれど",
+        "なら", "ば", "って", "ので", "から", "まで",
+    }
+
+    @classmethod
+    def _is_nonlexical_token(cls, token: TokenModel) -> bool:
+        """Rejects function-word candidates even when the tokenizer labels them OTHER."""
+        if token.pos in ("PUNCTUATION", "PARTICLE", "AUX_VERB"):
+            return True
+        # Avoid suppressing a legitimate lexical NOUN/VERB merely because its
+        # written form is short hiragana; this guard is for mis-tagged OTHER only.
+        if str(token.pos or "").upper() != "OTHER":
+            return False
+        surface = str(token.surface or "").strip()
+        return bool(
+            surface in cls.GRAMMATICAL_ONLY_SURFACES
+            and re.fullmatch(r"[ぁ-ゖー]+", surface)
+        )
+
+    @staticmethod
+    def _candidate_pos_matches(token_pos: str, dictionary_pos: str) -> bool:
+        """Checks coarse POS compatibility between NLP token and dictionary sense."""
+        token_pos = str(token_pos or "OTHER").upper()
+        dictionary_pos = str(dictionary_pos or "").casefold()
+        if not dictionary_pos:
+            return False
+
+        markers = {
+            "NOUN": ("noun", "pronoun", "counter", "proper noun", "numeric"),
+            "VERB": ("verb", "godan", "ichidan", "suru verb"),
+            "ADJECTIVE": ("adjective", "keiyoushi", "keiyoudoushi", "keiyodoshi", "adjectival noun"),
+            "ADVERB": ("adverb", "fukushi"),
+            "INTERJECTION": ("interjection", "kandoushi"),
+            "CONJUNCTION": ("conjunction", "setsuzokushi"),
+            "DETERMINER": ("determiner", "pre-noun adjectival", "rentaishi"),
+        }
+        expected = markers.get(token_pos)
+        return any(marker in dictionary_pos for marker in expected) if expected else True
+
+    @staticmethod
+    def _normalize_reading(reading: str) -> str:
+        """Normalizes kana spellings so katakana NLP readings match hiragana dictionaries."""
+        normalized = []
+        for char in str(reading or "").strip():
+            codepoint = ord(char)
+            if 0x30A1 <= codepoint <= 0x30F6:
+                char = chr(codepoint - 0x60)
+            if not char.isspace():
+                normalized.append(char)
+        return "".join(normalized)
+
     def build_token_candidates(
         self, tokens: List[TokenModel], limit: int = 5
     ) -> Dict[str, List[Dict[str, str]]]:
-        """Builds occurrence-level dictionary candidates keyed by local token key."""
+        """Builds occurrence-level candidates with function-word and POS filtering.
+
+        Inflected verbs/adjectives/adverbs prefer lemma lookups so a surface-form
+        homograph cannot crowd out the lexical sense for the actual token. Only
+        dictionary senses compatible with the NLP token's coarse part of speech
+        are sent to the LLM.
+        """
         result: Dict[str, List[Dict[str, str]]] = {}
+        lookup_limit = max(20, limit * 4)
+
         for index, token in enumerate(tokens):
-            if token.pos in ("PUNCTUATION", "PARTICLE", "AUX_VERB"):
+            if self._is_nonlexical_token(token):
                 continue
 
             token_key = f"t{index + 1}"
-            entries = self.lookup_candidates(token.surface, limit=limit)
-            if not entries and token.lemma != token.surface:
-                entries = self.lookup_candidates(token.lemma, limit=limit)
+            surface = str(token.surface or "").strip()
+            lemma = str(token.lemma or surface).strip()
+            if not surface:
+                continue
+
+            if lemma != surface and token.pos in ("VERB", "ADJECTIVE", "ADVERB"):
+                lookup_words = [lemma, surface]
+            else:
+                lookup_words = [surface, lemma]
+
+            entries: List[DictionaryEntry] = []
+            for word in dict.fromkeys(w for w in lookup_words if w):
+                raw_entries = self.lookup_candidates(word, limit=lookup_limit)
+                compatible = [
+                    entry for entry in raw_entries
+                    if self._candidate_pos_matches(token.pos, entry.pos)
+                ]
+                # For an uninflected token, exact reading is a useful homograph
+                # filter (e.g. 自然=しぜん vs 自然=じねん). Do not apply it to an
+                # inflected surface because dictionary readings usually use lemmas.
+                if compatible and lemma == surface and token.reading:
+                    target_reading = self._normalize_reading(token.reading)
+                    reading_matches = [
+                        entry for entry in compatible
+                        if self._normalize_reading(entry.reading) == target_reading
+                    ]
+                    if reading_matches:
+                        compatible = reading_matches
+
+                # Contextually constrain common kana homographs whose unrelated
+                # dictionary entries share the same reading and coarse POS.
+                previous_surface = str(tokens[index - 1].surface or "") if index > 0 else ""
+                next_surface = str(tokens[index + 1].surface or "") if index + 1 < len(tokens) else ""
+                if surface == "つ" and re.fullmatch(r"[0-9一二三四五六七八九十百千万]+", previous_surface):
+                    counter_entries = [
+                        entry for entry in compatible
+                        if "counter" in str(entry.pos or "").casefold()
+                    ]
+                    if counter_entries:
+                        compatible = counter_entries
+                    # In patterns like 4つのポイント, the age sense is inapplicable.
+                    if next_surface == "の":
+                        non_age_counters = [
+                            entry for entry in compatible
+                            if str(entry.meaning or "").strip().casefold() not in {
+                                "年齢", "年", "歳", "年岁", "tuổi", "years old",
+                            }
+                            and not re.search(r"\b(age|years old)\b", str(entry.meaning or "").casefold())
+                        ]
+                        if non_age_counters:
+                            compatible = non_age_counters
+
+                previous_token = tokens[index - 1] if index > 0 else None
+                is_abstract_koto = (
+                    surface == "こと"
+                    and previous_token is not None
+                    and (
+                        str(previous_token.surface or "") in ("いう", "言う")
+                        or str(previous_token.lemma or "") in ("いう", "言う")
+                    )
+                )
+                if is_abstract_koto:
+                    abstract_entries = [
+                        entry for entry in compatible
+                        if str(entry.term or "") == "事"
+                        and "particle" not in str(entry.pos or "").casefold()
+                    ]
+                    if abstract_entries:
+                        compatible = abstract_entries
+
+                if compatible:
+                    entries = compatible
+                    break
+
             if not entries:
                 continue
 
@@ -206,12 +350,14 @@ class KnowledgeService:
                     "token_id": token.token_id,
                     "token": token.surface,
                     "lemma": token.lemma,
+                    "token_pos": token.pos,
                     "term": entry.term,
                     "reading": entry.reading,
                     "pos": entry.pos,
                     "meaning": entry.meaning,
+                    "gloss_en": entry.gloss_en,
                 }
-                for candidate_index, entry in enumerate(entries, start=1)
+                for candidate_index, entry in enumerate(entries[:limit], start=1)
             ]
         return result
 
