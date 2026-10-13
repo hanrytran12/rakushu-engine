@@ -281,7 +281,10 @@ def stream_pipeline(
                             "text": sent_text,
                         })
                 for tok in tokens:
-                    if tok.surface in token_meanings:
+                    # Prefer the exact occurrence before the potentially ambiguous surface alias.
+                    if tok.token_id in token_meanings:
+                        tok.context_meaning = token_meanings[tok.token_id]
+                    elif tok.surface in token_meanings:
                         tok.context_meaning = token_meanings[tok.surface]
 
                 logger.info(

@@ -276,7 +276,11 @@ def run_pipeline(media_path: str = "samples/japanese_podcast_10s.mp4") -> Pipeli
 
         # Step D: Assign Contextual Meanings to Tokens
         for tok in tokens:
-            if tok.surface in token_meanings:
+            # Occurrence-level token_id is authoritative; surface aliases are only
+            # a compatibility fallback and can collide when a surface repeats.
+            if tok.token_id in token_meanings:
+                tok.context_meaning = token_meanings[tok.token_id]
+            elif tok.surface in token_meanings:
                 tok.context_meaning = token_meanings[tok.surface]
         all_tokens.extend(tokens)
 

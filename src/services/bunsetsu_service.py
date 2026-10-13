@@ -79,7 +79,7 @@ class BunsetsuService:
             start_time = round(segment.start_time + (start_pos / total_chars) * duration, 2)
             end_time = round(segment.start_time + (end_pos / total_chars) * duration, 2)
             meaning = self.PHRASE_TRANSLATIONS.get(
-                text, self._generate_span_meaning(span, token_meanings)
+                text, self._generate_span_meaning(span, token_meanings, tokens)
             )
 
             phrases.append(BunsetsuPhrase(
@@ -94,14 +94,40 @@ class BunsetsuService:
 
         return phrases
 
-    def _generate_span_meaning(self, span, token_meanings: Optional[Dict[str, str]] = None) -> str:
+    def _generate_span_meaning(
+        self,
+        span,
+        token_meanings: Optional[Dict[str, str]] = None,
+        model_tokens: Optional[List[TokenModel]] = None,
+    ) -> str:
         meanings = []
         tm = token_meanings or {}
+
+        # Prefer occurrence-specific TokenModel meanings when source offsets line
+        # up with this GiNZA span. Surface aliases can collide for repeated tokens.
+        if model_tokens:
+            covered_tokens = [
+                token for token in model_tokens
+                if token.start_position < span.end_char and token.end_position > span.start_char
+            ]
+            for token in covered_tokens:
+                meaning = (
+                    token.context_meaning
+                    or tm.get(token.token_id)
+                    or tm.get(token.surface)
+                    or tm.get(token.lemma)
+                )
+                if meaning:
+                    meanings.append(meaning)
+            if meanings:
+                return " + ".join(meanings)
+
+        # Compatibility fallback for tokens not aligned to the model-token offsets.
         for t in span:
             if t.pos_ not in ("PUNCT",):
-                m = tm.get(t.orth_, tm.get(t.lemma_, t.lemma_))
-                if m:
-                    meanings.append(m)
+                meaning = tm.get(t.orth_, tm.get(t.lemma_, t.lemma_))
+                if meaning:
+                    meanings.append(meaning)
         return " + ".join(meanings) if meanings else span.text
 
     def _group_bunsetsu_rules(
@@ -122,7 +148,7 @@ class BunsetsuService:
             meaning = self.PHRASE_TRANSLATIONS.get(
                 combined_text,
                 " + ".join(
-                    tm.get(t.surface, tm.get(t.lemma, t.lemma))
+                    t.context_meaning or tm.get(t.token_id) or tm.get(t.surface, tm.get(t.lemma, t.lemma))
                     for t in cluster
                     if t.pos != "PUNCTUATION"
                 )

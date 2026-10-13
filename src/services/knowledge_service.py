@@ -46,7 +46,7 @@ class KnowledgeService:
             conn.close()
 
     def lookup(self, word: str) -> Optional[DictionaryEntry]:
-        """Looks up a word in cache, SQLite DB, or fallback."""
+        """Looks up a Vietnamese-meaning dictionary entry by exact term, then reading."""
         if not word or word in self.exclude_terms:
             return None
         if word in self.in_memory_cache:
@@ -58,32 +58,63 @@ class KnowledgeService:
                 cur = conn.cursor()
                 cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='staging_entries'")
                 if cur.fetchone():
-                    cur.execute(
-                        "SELECT term, reading, pos, meaning_vi, gloss_en FROM staging_entries "
-                        "WHERE term = ? OR reading = ? LIMIT 1",
-                        (word, word)
-                    )
-                    r = cur.fetchone()
-                    if r:
-                        entry = DictionaryEntry(term=r[0], reading=r[1], pos=r[2], meaning=r[3] or r[4] or "")
+                    cur.execute("SELECT 1 FROM staging_entries WHERE term = ? LIMIT 1", (word,))
+                    has_exact_term = cur.fetchone() is not None
+                    if has_exact_term:
+                        cur.execute(
+                            "SELECT term, reading, pos, meaning_vi, gloss_en "
+                            "FROM staging_entries WHERE term = ? "
+                            "AND meaning_vi IS NOT NULL AND TRIM(meaning_vi) != '' "
+                            "ORDER BY rowid LIMIT 1",
+                            (word,),
+                        )
+                    else:
+                        cur.execute(
+                            "SELECT term, reading, pos, meaning_vi, gloss_en "
+                            "FROM staging_entries WHERE reading = ? "
+                            "AND meaning_vi IS NOT NULL AND TRIM(meaning_vi) != '' "
+                            "ORDER BY rowid LIMIT 1",
+                            (word,),
+                        )
+                    row = cur.fetchone()
+                    if row:
+                        entry = DictionaryEntry(
+                            term=row[0], reading=row[1], pos=row[2],
+                            meaning=str(row[3]).strip(), gloss_en=row[4] or "",
+                        )
                         self.in_memory_cache[word] = entry
                         return entry
+                    if has_exact_term:
+                        return None
                 else:
-                    cur.execute(
-                        "SELECT term, reading, pos, definition_tags, rules, score, meaning, sequence, term_tags "
-                        "FROM dictionary WHERE term = ? OR reading = ? LIMIT 1",
-                        (word, word),
-                    )
+                    cur.execute("SELECT 1 FROM dictionary WHERE term = ? LIMIT 1", (word,))
+                    has_exact_term = cur.fetchone() is not None
+                    if has_exact_term:
+                        cur.execute(
+                            "SELECT term, reading, pos, definition_tags, rules, score, meaning, sequence, term_tags "
+                            "FROM dictionary WHERE term = ? AND TRIM(COALESCE(meaning, '')) != '' "
+                            "ORDER BY reading ASC LIMIT 1",
+                            (word,),
+                        )
+                    else:
+                        cur.execute(
+                            "SELECT term, reading, pos, definition_tags, rules, score, meaning, sequence, term_tags "
+                            "FROM dictionary WHERE reading = ? AND TRIM(COALESCE(meaning, '')) != '' "
+                            "ORDER BY score DESC, sequence ASC LIMIT 1",
+                            (word,),
+                        )
                     row = cur.fetchone()
                     if row:
                         entry = DictionaryEntry(
                             term=row[0], reading=row[1], pos=row[2],
                             definition_tags=row[3] or "", rules=row[4] or "",
-                            score=int(row[5] or 1), meaning=row[6] or "",
-                            sequence=int(row[7] or 0), term_tags=row[8] or ""
+                            score=int(row[5] or 1), meaning=str(row[6]).strip(),
+                            sequence=int(row[7] or 0), term_tags=row[8] or "",
                         )
                         self.in_memory_cache[word] = entry
                         return entry
+                    if has_exact_term:
+                        return None
             finally:
                 conn.close()
 
@@ -117,7 +148,7 @@ class KnowledgeService:
         return senses
 
     def lookup_candidates(self, word: str, limit: int = 5) -> List[DictionaryEntry]:
-        """Returns bounded dictionary senses for contextual meaning selection."""
+        """Returns Vietnamese dictionary senses, preferring exact lexical terms."""
         if not word or word in self.exclude_terms or limit <= 0:
             return []
 
@@ -128,48 +159,79 @@ class KnowledgeService:
             try:
                 cur = conn.cursor()
                 cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='staging_entries'")
-                if cur.fetchone():
-                    cur.execute(
-                        "SELECT term, reading, pos, meaning_vi, gloss_en "
-                        "FROM staging_entries WHERE term = ? OR reading = ? "
-                        "ORDER BY rowid LIMIT ?",
-                        (word, word, limit * 3),
-                    )
-                    for term, reading, pos, meaning_vi, gloss_en in cur.fetchall():
-                        for sense in self._expand_meanings((meaning_vi or gloss_en or "").strip()):
+                is_staging = cur.fetchone() is not None
+
+                if is_staging:
+                    cur.execute("SELECT 1 FROM staging_entries WHERE term = ? LIMIT 1", (word,))
+                    has_exact_term = cur.fetchone() is not None
+                    if has_exact_term:
+                        cur.execute(
+                            "SELECT term, reading, pos, meaning_vi, gloss_en "
+                            "FROM staging_entries WHERE term = ? "
+                            "AND meaning_vi IS NOT NULL AND TRIM(meaning_vi) != '' "
+                            "ORDER BY rowid LIMIT ?",
+                            (word, limit * 3),
+                        )
+                    else:
+                        cur.execute(
+                            "SELECT term, reading, pos, meaning_vi, gloss_en "
+                            "FROM staging_entries WHERE reading = ? "
+                            "AND meaning_vi IS NOT NULL AND TRIM(meaning_vi) != '' "
+                            "ORDER BY rowid LIMIT ?",
+                            (word, limit * 3),
+                        )
+                    rows = cur.fetchall()
+
+                    for term, reading, pos, meaning_vi, gloss_en in rows:
+                        # English glosses are metadata only; never turn them into candidate meanings.
+                        if not meaning_vi or not meaning_vi.strip():
+                            continue
+                        for sense in self._expand_meanings(meaning_vi.strip()):
                             key = (term, reading, pos, sense)
                             if sense and key not in seen:
                                 seen.add(key)
-                                candidates.append(
-                                    DictionaryEntry(
-                                        term=term, reading=reading, pos=pos, meaning=sense
-                                    )
-                                )
+                                candidates.append(DictionaryEntry(
+                                    term=term, reading=reading, pos=pos, meaning=sense,
+                                    gloss_en=(gloss_en or "")[:240],
+                                ))
                             if len(candidates) >= limit:
                                 break
                         if len(candidates) >= limit:
                             break
                 else:
-                    cur.execute(
-                        "SELECT term, reading, pos, definition_tags, rules, score, "
-                        "meaning, sequence, term_tags FROM dictionary "
-                        "WHERE term = ? OR reading = ? "
-                        "ORDER BY score DESC, sequence ASC LIMIT ?",
-                        (word, word, limit * 3),
-                    )
-                    for row in cur.fetchall():
-                        for sense in self._expand_meanings((row[6] or "").strip()):
+                    cur.execute("SELECT 1 FROM dictionary WHERE term = ? LIMIT 1", (word,))
+                    has_exact_term = cur.fetchone() is not None
+                    if has_exact_term:
+                        cur.execute(
+                            "SELECT term, reading, pos, definition_tags, rules, score, "
+                            "meaning, sequence, term_tags FROM dictionary "
+                            "WHERE term = ? AND TRIM(COALESCE(meaning, '')) != '' "
+                            "ORDER BY score DESC, sequence ASC LIMIT ?",
+                            (word, limit * 3),
+                        )
+                    else:
+                        cur.execute(
+                            "SELECT term, reading, pos, definition_tags, rules, score, "
+                            "meaning, sequence, term_tags FROM dictionary "
+                            "WHERE reading = ? AND TRIM(COALESCE(meaning, '')) != '' "
+                            "ORDER BY score DESC, sequence ASC LIMIT ?",
+                            (word, limit * 3),
+                        )
+                    rows = cur.fetchall()
+
+                    for row in rows:
+                        if not row[6] or not str(row[6]).strip():
+                            continue
+                        for sense in self._expand_meanings(str(row[6]).strip()):
                             key = (row[0], row[1], row[2], sense)
                             if sense and key not in seen:
                                 seen.add(key)
-                                candidates.append(
-                                    DictionaryEntry(
-                                        term=row[0], reading=row[1], pos=row[2],
-                                        definition_tags=row[3] or "", rules=row[4] or "",
-                                        score=int(row[5] or 1), meaning=sense,
-                                        sequence=int(row[7] or 0), term_tags=row[8] or "",
-                                    )
-                                )
+                                candidates.append(DictionaryEntry(
+                                    term=row[0], reading=row[1], pos=row[2],
+                                    definition_tags=row[3] or "", rules=row[4] or "",
+                                    score=int(row[5] or 1), meaning=sense,
+                                    sequence=int(row[7] or 0), term_tags=row[8] or "",
+                                ))
                             if len(candidates) >= limit:
                                 break
                         if len(candidates) >= limit:
@@ -179,23 +241,173 @@ class KnowledgeService:
 
         if not candidates:
             fallback = self.CORE_FALLBACK.get(word)
-            if fallback:
+            if fallback and fallback.meaning.strip():
                 candidates.append(fallback)
         return candidates
+
+    GRAMMATICAL_ONLY_SURFACES = {
+        "な", "か", "よ", "ね", "の", "で", "に", "は", "が", "を", "も",
+        "と", "て", "へ", "や", "さ", "ぞ", "たり", "けど", "けれど",
+        "なら", "ば", "って", "ので", "から", "まで", "など",
+    }
+
+    @classmethod
+    def _is_nonlexical_token(cls, token: TokenModel) -> bool:
+        """Rejects function-word candidates even when the tokenizer labels them OTHER."""
+        if token.pos in ("PUNCTUATION", "PARTICLE", "AUX_VERB"):
+            return True
+        # Avoid suppressing a legitimate lexical NOUN/VERB merely because its
+        # written form is short hiragana; this guard is for mis-tagged OTHER only.
+        if str(token.pos or "").upper() != "OTHER":
+            return False
+        surface = str(token.surface or "").strip()
+        return bool(
+            surface in cls.GRAMMATICAL_ONLY_SURFACES
+            and re.fullmatch(r"[ぁ-ゖー]+", surface)
+        )
+
+    @staticmethod
+    def _candidate_pos_matches(token_pos: str, dictionary_pos: str) -> bool:
+        """Checks coarse POS compatibility between NLP token and dictionary sense."""
+        token_pos = str(token_pos or "OTHER").upper()
+        dictionary_pos = str(dictionary_pos or "").casefold()
+        if not dictionary_pos:
+            return False
+
+        markers = {
+            "NOUN": ("noun", "pronoun", "counter", "proper noun", "numeric"),
+            "VERB": ("verb", "godan", "ichidan", "suru verb"),
+            "ADJECTIVE": ("adjective", "keiyoushi", "keiyoudoushi", "keiyodoshi", "adjectival noun"),
+            "ADVERB": ("adverb", "fukushi"),
+            "INTERJECTION": ("interjection", "kandoushi"),
+            "CONJUNCTION": ("conjunction", "setsuzokushi"),
+            "DETERMINER": ("determiner", "pre-noun adjectival", "rentaishi"),
+        }
+        expected = markers.get(token_pos)
+        return any(marker in dictionary_pos for marker in expected) if expected else True
+
+    @staticmethod
+    def _normalize_reading(reading: str) -> str:
+        """Normalizes kana spellings so katakana NLP readings match hiragana dictionaries."""
+        normalized = []
+        for char in str(reading or "").strip():
+            codepoint = ord(char)
+            if 0x30A1 <= codepoint <= 0x30F6:
+                char = chr(codepoint - 0x60)
+            if not char.isspace():
+                normalized.append(char)
+        return "".join(normalized)
 
     def build_token_candidates(
         self, tokens: List[TokenModel], limit: int = 5
     ) -> Dict[str, List[Dict[str, str]]]:
-        """Builds occurrence-level dictionary candidates keyed by local token key."""
+        """Builds occurrence-level candidates with function-word and POS filtering.
+
+        Inflected verbs/adjectives/adverbs prefer lemma lookups so a surface-form
+        homograph cannot crowd out the lexical sense for the actual token. Only
+        dictionary senses compatible with the NLP token's coarse part of speech
+        are sent to the LLM.
+        """
         result: Dict[str, List[Dict[str, str]]] = {}
+        lookup_limit = max(20, limit * 4)
+
         for index, token in enumerate(tokens):
-            if token.pos in ("PUNCTUATION", "PARTICLE", "AUX_VERB"):
+            if self._is_nonlexical_token(token):
                 continue
 
             token_key = f"t{index + 1}"
-            entries = self.lookup_candidates(token.surface, limit=limit)
-            if not entries and token.lemma != token.surface:
-                entries = self.lookup_candidates(token.lemma, limit=limit)
+            surface = str(token.surface or "").strip()
+            lemma = str(token.lemma or surface).strip()
+            if not surface:
+                continue
+
+            if lemma in {"いる", "居る"} and index > 0:
+                previous = tokens[index - 1]
+                previous_surface = re.sub(r"[、。，．,.;；]+$", "", str(previous.surface or "").strip())
+                previous_lemma = str(previous.lemma or "").strip()
+                if previous_surface in {"て", "で"} or previous_lemma in {"て", "で"}:
+                    continue
+
+            if lemma in {"いる", "居る"}:
+                # Kana lemma いる is highly ambiguous in JMDict (居る/要る/入る/射る...).
+                # Keep lexical lookup on the existence/auxiliary lemma instead of the inflected surface.
+                lookup_words = [lemma]
+            elif lemma != surface and token.pos in ("VERB", "ADJECTIVE", "ADVERB"):
+                lookup_words = [lemma, surface]
+            else:
+                lookup_words = [surface, lemma]
+
+            entries: List[DictionaryEntry] = []
+            for word in dict.fromkeys(w for w in lookup_words if w):
+                raw_entries = self.lookup_candidates(word, limit=lookup_limit)
+                compatible = [
+                    entry for entry in raw_entries
+                    if self._candidate_pos_matches(token.pos, entry.pos)
+                ]
+                if lemma in {"いる", "居る"}:
+                    # Only retain the canonical 居る/いる entry; same-reading words such as 入る,
+                    # 要る, 射る and 炒る are different lexemes, not candidate senses for this lemma.
+                    compatible = [
+                        entry for entry in compatible
+                        if str(entry.term or "") in {"いる", "居る"}
+                    ]
+                # For an uninflected token, exact reading is a useful homograph
+                # filter (e.g. 自然=しぜん vs 自然=じねん). Do not apply it to an
+                # inflected surface because dictionary readings usually use lemmas.
+                if compatible and lemma == surface and token.reading:
+                    target_reading = self._normalize_reading(token.reading)
+                    reading_matches = [
+                        entry for entry in compatible
+                        if self._normalize_reading(entry.reading) == target_reading
+                    ]
+                    if reading_matches:
+                        compatible = reading_matches
+
+                # Contextually constrain common kana homographs whose unrelated
+                # dictionary entries share the same reading and coarse POS.
+                previous_surface = str(tokens[index - 1].surface or "") if index > 0 else ""
+                next_surface = str(tokens[index + 1].surface or "") if index + 1 < len(tokens) else ""
+                if surface == "つ" and re.fullmatch(r"[0-9一二三四五六七八九十百千万]+", previous_surface):
+                    counter_entries = [
+                        entry for entry in compatible
+                        if "counter" in str(entry.pos or "").casefold()
+                    ]
+                    if counter_entries:
+                        compatible = counter_entries
+                    # In patterns like 4つのポイント, the age sense is inapplicable.
+                    if next_surface == "の":
+                        non_age_counters = [
+                            entry for entry in compatible
+                            if str(entry.meaning or "").strip().casefold() not in {
+                                "年齢", "年", "歳", "年岁", "tuổi", "years old",
+                            }
+                            and not re.search(r"\b(age|years old)\b", str(entry.meaning or "").casefold())
+                        ]
+                        if non_age_counters:
+                            compatible = non_age_counters
+
+                previous_token = tokens[index - 1] if index > 0 else None
+                is_abstract_koto = (
+                    surface == "こと"
+                    and previous_token is not None
+                    and (
+                        str(previous_token.surface or "") in ("いう", "言う")
+                        or str(previous_token.lemma or "") in ("いう", "言う")
+                    )
+                )
+                if is_abstract_koto:
+                    abstract_entries = [
+                        entry for entry in compatible
+                        if str(entry.term or "") == "事"
+                        and "particle" not in str(entry.pos or "").casefold()
+                    ]
+                    if abstract_entries:
+                        compatible = abstract_entries
+
+                if compatible:
+                    entries = compatible
+                    break
+
             if not entries:
                 continue
 
@@ -206,12 +418,14 @@ class KnowledgeService:
                     "token_id": token.token_id,
                     "token": token.surface,
                     "lemma": token.lemma,
+                    "token_pos": token.pos,
                     "term": entry.term,
                     "reading": entry.reading,
                     "pos": entry.pos,
                     "meaning": entry.meaning,
+                    "gloss_en": entry.gloss_en,
                 }
-                for candidate_index, entry in enumerate(entries, start=1)
+                for candidate_index, entry in enumerate(entries[:limit], start=1)
             ]
         return result
 
